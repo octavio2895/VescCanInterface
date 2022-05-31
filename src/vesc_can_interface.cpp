@@ -1,50 +1,206 @@
 #include "vesc_can_interface.h"
-#include <cstring>
-#include <iostream>
 
 namespace vesc_can_driver
 {
-  VescCanInterface::VescCanInterface(int dev_id)
+  VescCanInterface::VescCanInterface()
   {
-    m_dev_id = dev_id;
-    m_socket = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    strcpy(m_ifr.ifr_name, "can0");
-    if (ioctl(m_socket, SIOCGIFINDEX, &m_ifr) < 0)
+    // m_dev_id = dev_id;
+    m_sock_err = 0;
+    if((m_socket = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0)
     {
-      printf("ERROR unable to connect to interface: %s\n", m_ifr.ifr_name);
+      printf("ERROR cannot create CAN socket: %d", m_socket);
+      return;
+    }
+    
+    strcpy(m_ifr.ifr_name, "can0");
+    if ((m_sock_err = ioctl(m_socket, SIOCGIFINDEX, &m_ifr)) < 0)
+    {
+      printf("ERROR unable to connect to interface: %s, error code:%d\n", m_ifr.ifr_name, m_sock_err);
       return;
     }
     m_addr.can_family = AF_CAN;
     m_addr.can_ifindex = m_ifr.ifr_ifindex;
     
-    bind(m_socket, (struct sockaddr *)&m_addr, sizeof(m_addr));
-    
-    struct can_filter rfilter[1];
-    rfilter[0].can_id = m_dev_id;
-    rfilter[0].can_mask = 0xFF;
-    setsockopt(m_socket, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter));
+    if ((m_sock_err = bind(m_socket, (struct sockaddr *)&m_addr, sizeof(m_addr)))<0)
+    {
+      printf("ERROR unable to bind to interface: %s, error code:%d\n", m_ifr.ifr_name, m_sock_err);
+      return;
+    }
   }
 
-  int VescCanInterface::requestState()
+  VescCanInterface::~VescCanInterface() 
+  {
+    stop();
+  }
+
+  void *VescCanInterface::update_thread() 
+  {
+    std::chrono::time_point<std::chrono::steady_clock> last_fw_request = std::chrono::steady_clock::now();
+    while (update_thread_run_) 
+    {
+      auto time = (const struct timespec) {0, state_request_millis * 1000000L};
+      nanosleep(&time, nullptr);
+      std::chrono::time_point<std::chrono::steady_clock> now = std::chrono::steady_clock::now();
+      VESC_CONNECTION_STATE state;
+      {
+        std::unique_lock<std::mutex> lk(status_mutex_);
+        state = status_.connection_state;
+      }
+      if (WAITING_FOR_FW == state) 
+      {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fw_request).count() >
+            1000) 
+        {
+          last_fw_request = now;
+          // requestFWVersion();
+        }
+        continue;
+      }
+      else if(status_.connection_state == CONNECTED || status_.connection_state == CONNECTED_INCOMPATIBLE_FW) 
+      {
+        // requestState();
+      }
+    }
+    return nullptr;
+  }
+
+  void *VescCanInterface::rx_thread() 
+  {
+    Buffer buffer;
+    buffer.reserve(4096);
+
+    {
+      std::unique_lock<std::mutex> lk(status_mutex_);
+      status_ = {0};
+      status_.connection_state = DISCONNECTED;
+    }
+    while (rx_thread_run_) 
+    {
+      // Check, if the serial port is connected. If not, connect to it.
+      if (m_socket < 0 || m_sock_err < 0) 
+      {
+        {
+          std::unique_lock<std::mutex> lk(status_mutex_);
+          status_ = {0};
+          status_.connection_state = DISCONNECTED;
+        }
+        try 
+        {
+          rx_thread_run_ = 0;
+          //TODO reconnect();
+        }
+        catch (std::exception &e) 
+        {
+          // retry later
+          sleep(1);
+          continue;
+        }
+        {
+          std::unique_lock<std::mutex> lk(status_mutex_);
+          status_.connection_state = VESC_CONNECTION_STATE::WAITING_FOR_FW;
+        }
+      }
+      m_pack = handle_packet();
+    }
+/*
+
+      int bytes_needed = VescFrame::VESC_MIN_FRAME_SIZE;
+      if (!buffer.empty()) 
+      {
+        // search buffer for valid packet(s)
+        Buffer::iterator iter(buffer.begin());
+        Buffer::iterator iter_begin(buffer.begin());
+        while (iter != buffer.end()) 
+        {
+          // check if valid start-of-frame character
+          if (VescFrame::VESC_SOF_VAL_SMALL_FRAME == *iter ||
+              VescFrame::VESC_SOF_VAL_LARGE_FRAME == *iter) 
+          {
+            // good start, now attempt to create packet
+            std::string error;
+            VescPacketConstPtr packet = VescPacketFactory::createPacket(iter, buffer.end(),
+                                                                        &bytes_needed,
+                                                                        &error);
+            if (packet) 
+            {
+              // good packet, check if we skipped any data
+              if (std::distance(iter_begin, iter) > 0) 
+              {
+                std::ostringstream ss;
+                ss << "Out-of-sync with VESC, unknown data leading valid frame. Discarding "
+                   << std::distance(iter_begin, iter) << " bytes.";
+                error_handler_(ss.str());
+              }
+              // call packet handler
+
+              handle_packet(packet);
+              // update state
+              iter = iter + packet->getFrame().size();
+              iter_begin = iter;
+              // continue to look for another frame in buffer
+              continue;
+            }
+            else if (bytes_needed > 0) 
+            {
+              // need more data, break out of while loop
+              break;  // for (iter_sof...
+            } 
+            else 
+            {
+              // else, this was not a packet, move on to next byte
+              error_handler_(error);
+            }
+          }
+
+          iter++;
+        }
+
+        // if iter is at the end of the buffer, more bytes are needed
+        if (iter == buffer.end())
+            bytes_needed = VescFrame::VESC_MIN_FRAME_SIZE;
+
+        // erase "used" buffer
+        if (std::distance(iter_begin, iter) > 0) 
+        {
+          std::ostringstream ss;
+          ss << "Out-of-sync with VESC, discarding " << std::distance(iter_begin, iter) << " bytes.";
+          error_handler_(ss.str());
+        }
+        buffer.erase(buffer.begin(), iter);
+      }
+
+      // attempt to read at least bytes_needed bytes from the serial port
+      int bytes_to_read = std::max(bytes_needed, std::min(4096, static_cast<int>(serial_.available())));
+      try 
+      {
+        int bytes_read = serial_.read(buffer, bytes_to_read);
+        if (bytes_needed > 0 && 0 == bytes_read && !buffer.empty()) 
+        {
+          error_handler_("Possibly out-of-sync with VESC, read timout in the middle of a frame.");
+        }
+      } 
+      catch (std::exception &e) 
+      {
+        error_handler_("error during serial read. reconnecting.");
+        {
+          std::unique_lock<std::mutex> lk(status_mutex_);
+          status_.connection_state = VESC_CONNECTION_STATE::DISCONNECTED;
+        }
+        serial_.close();
+      }
+    }
+  */
+    close(m_socket);
+    return nullptr;
+  }
+
+  int VescCanInterface::handle_packet()
   {
     m_nbytes = read(m_socket, &m_recvframe, sizeof(struct can_frame));
     int ind = 0;
     uint8_t recv_id = m_recvframe.can_id;
     uint8_t pack_id = m_recvframe.can_id >> 8;  
 
-    // Verify the frame id and can id:
-    // if ( (status->id >0) && (recv_id != status->id))
-      // return -1;
-
-    //printf ("can id:%i, frame id:%i\n", recv_id, pack_id);
-
-    // Read the selected data:
-  // (1652470486.398796) can0 0000082D#020000
-  // (1652470486.399054) can0 00000502#000005023630003D
-  // (1652470486.399357) can0 00000502#070034000B503152
-  // (1652470486.399629) can0 00000502#0E39363420000000
-  // (1652470486.399842) can0 00000502#1500
-  // (1652470486.400147) can0 00000702#2D01001651B9
     switch (pack_id)
     {
       case CAN_PACKET_FILL_RX_BUFFER:
@@ -136,7 +292,87 @@ namespace vesc_can_driver
 
     return 0;
   }
+/*
+  bool VescCanInterface::send(const VescPacket &packet) {
+      std::unique_lock<std::mutex> lk(serial_tx_mutex_);
+      if (!serial_.isOpen()) {
+          return false;
+      }
+      size_t written = serial_.write(packet.getFrame());
+      if (written != packet.getFrame().size()) {
+          return false;
+      }
+      return true;
+  }
 
+  void VescCanInterface::requestFWVersion() {
+      send(VescPacketRequestFWVersion());
+  }
+
+  void VescCanInterface::requestState() {
+      send(VescPacketRequestValues());
+  }
+
+  void VescCanInterface::setDutyCycle(double duty_cycle) {
+      send(VescPacketSetDuty(duty_cycle));
+  }
+
+  void VescCanInterface::setCurrent(double current) {
+      send(VescPacketSetCurrent(current));
+  }
+
+  void VescCanInterface::setBrake(double brake) {
+      send(VescPacketSetCurrentBrake(brake));
+  }
+
+  void VescCanInterface::setSpeed(double speed) {
+      send(VescPacketSetVelocityERPM(speed));
+  }
+
+  void VescCanInterface::setPosition(double position) {
+      send(VescPacketSetPos(position));
+  }
+*/
+  void VescCanInterface::start(uint32_t dev_id) 
+  {
+    m_dev_id = dev_id;
+    // Set kernel-level filter for CANID
+    struct can_filter rfilter[1];
+    rfilter[0].can_id = m_dev_id;
+    rfilter[0].can_mask = 0xFF;
+    setsockopt(m_socket, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter));
+    // start threads
+    rx_thread_run_ = true;
+    update_thread_run_ = true;
+    pthread_create(&rx_thread_handle_, NULL, &VescCanInterface::rx_thread_helper, this);
+    pthread_create(&update_thread_handle_, NULL, &VescCanInterface::update_thread_helper, this);
+  }
+
+  void VescCanInterface::stop() {
+      // stops the motor
+      // setDutyCycle(0.0);
+
+      // tell the io thread to stop
+      rx_thread_run_ = false;
+      update_thread_run_ = false;
+
+      // wait for io thread to actually exit
+      pthread_join(rx_thread_handle_, nullptr);
+      pthread_join(update_thread_handle_, nullptr);
+  }
+/*
+  void VescCanInterface::get_status(VescStatusStruct *status) {
+      std::unique_lock<std::mutex> lk(status_mutex_);
+      *status = status_;
+  }
+
+  void VescCanInterface::wait_for_status(VescStatusStruct *status) {
+      std::unique_lock<std::mutex> lk(status_mutex_);
+      // wait for new data
+      status_cv_.wait(lk);
+      *status = status_;
+  }
+*/
 }
 
 void bldc_buffer_append_int16(uint8_t* buffer, int16_t number, int32_t *index)
