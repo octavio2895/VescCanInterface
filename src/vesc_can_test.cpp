@@ -25,4 +25,11 @@ int main(int argc, char *argv[])
          vesc_dev.status_.uuid[10], vesc_dev.status_.uuid[11]);
   printf("Paring done: %d", vesc_dev.status_.pairing_done);
   std::cin.get();
+  printf("Setting DC to 50\n");
+  for (int i = 0 ; i < 100000; i++)
+  {
+    vesc_dev.setDutyCycle(5);
+    usleep(20);
+  }
+  std::cin.get();
 }

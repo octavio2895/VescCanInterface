@@ -47,10 +47,12 @@ namespace vesc_can_driver
     uint16_t m_crc_check;
     int process_rx_buffer();
     int handle_packet();
+    uint32_t genEId(uint32_t, uint32_t);
     bool update_thread_run_;
     bool rx_thread_run_;
-    uint32_t state_request_millis; //maybe signed?
+    uint32_t state_request_millis = 1; //maybe signed?
     std::mutex status_mutex_;
+    std::mutex m_tx_mutex;
     pthread_t rx_thread_handle_;
     pthread_t update_thread_handle_;
     static void *rx_thread_helper(void *context) 
@@ -70,6 +72,7 @@ namespace vesc_can_driver
     VescCanInterface();
     ~VescCanInterface();
     void stop(); 
+    bool send(can_frame *frame); 
     void start(uint32_t id); 
     void *update_thread();
     void *rx_thread();
@@ -77,6 +80,12 @@ namespace vesc_can_driver
     int get_status(VescStatusStruct *status);
     void requestState();
     void requestFWVersion();
+    void setDutyCycle(double);
+    void setCurrent(double);
+    void setBrake(double);
+    void setSpeed(double);
+    void setPosition(double);
+
   };
 }
 

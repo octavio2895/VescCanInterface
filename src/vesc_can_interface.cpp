@@ -1,4 +1,5 @@
 #include "vesc_can_interface.h"
+#include "datatypes.h"
 
 namespace vesc_can_driver
 {
@@ -35,6 +36,7 @@ namespace vesc_can_driver
 
   void *VescCanInterface::update_thread() 
   {
+    printf("Starting update thread\n");
     std::chrono::time_point<std::chrono::steady_clock> last_fw_request = std::chrono::steady_clock::now();
     while (update_thread_run_) 
     {
@@ -46,13 +48,14 @@ namespace vesc_can_driver
         std::unique_lock<std::mutex> lk(status_mutex_);
         state = status_.connection_state;
       }
-      if (WAITING_FOR_FW == state) 
+      if (WAITING_FOR_FW >= state) 
       {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fw_request).count() >
             1000) 
         {
+          printf("Requesting \n");
           last_fw_request = now;
-          // requestFWVersion();
+          requestFWVersion();
         }
         continue;
       }
@@ -61,6 +64,7 @@ namespace vesc_can_driver
         // requestState();
       }
     }
+    printf("Joining Update Thread");
     return nullptr;
   }
 
@@ -286,55 +290,81 @@ namespace vesc_can_driver
           status_.qmlui_hw = m_rx_buffer[ind++];
           status_.qmlui_app = m_rx_buffer[ind];
         }
-        
+        if(status_.connection_state == WAITING_FOR_FW || status_.connection_state == DISCONNECTED)
+          status_.connection_state = CONNECTED;
         break;
     }
 
     return 0;
   }
+
+  bool VescCanInterface::send(can_frame *send_frame) 
+  {
+    std::unique_lock<std::mutex> lk(m_tx_mutex);
+    if (m_sock_err>=0) 
+    {
+      int i = write(m_socket, send_frame, sizeof(struct can_frame));
+      printf("Written %d\n", i);
+    }
+    return true;
+  }
+
+  void VescCanInterface::requestFWVersion() 
+  {
+    can_frame frame;
+    frame.can_id = genEId(0x2D, CAN_PACKET_PROCESS_SHORT_BUFFER); 
+    frame.can_dlc = 0x1;  
+    frame.data[0] = 0x02;
+    send(&frame);
+  }
+
+  uint32_t VescCanInterface::genEId(uint32_t id, uint32_t  packet_id)
+  {
+    id |= packet_id << 8;  // Next lowest byte is the packet id.
+    return(id |= 0x80000000);              // Send in Extended Frame Format.
+  }
 /*
-  bool VescCanInterface::send(const VescPacket &packet) {
-      std::unique_lock<std::mutex> lk(serial_tx_mutex_);
-      if (!serial_.isOpen()) {
-          return false;
-      }
-      size_t written = serial_.write(packet.getFrame());
-      if (written != packet.getFrame().size()) {
-          return false;
-      }
-      return true;
-  }
-
-  void VescCanInterface::requestFWVersion() {
-      send(VescPacketRequestFWVersion());
-  }
-
   void VescCanInterface::requestState() {
       send(VescPacketRequestValues());
   }
-
-  void VescCanInterface::setDutyCycle(double duty_cycle) {
-      send(VescPacketSetDuty(duty_cycle));
-  }
-
-  void VescCanInterface::setCurrent(double current) {
-      send(VescPacketSetCurrent(current));
-  }
-
-  void VescCanInterface::setBrake(double brake) {
-      send(VescPacketSetCurrentBrake(brake));
-  }
-
-  void VescCanInterface::setSpeed(double speed) {
-      send(VescPacketSetVelocityERPM(speed));
-  }
-
-  void VescCanInterface::setPosition(double position) {
-      send(VescPacketSetPos(position));
-  }
 */
+  void VescCanInterface::setDutyCycle(double duty_cycle) 
+  {
+    can_frame frame;
+    uint8_t can_buff[16];
+    int32_t ind = 0;
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_DUTY); 
+    printf("Filling buf\n");
+    bldc_buffer_append_float32(can_buff, duty_cycle,1e5, &ind); 
+    printf("buff filled");
+    frame.can_dlc = 0x1;  
+    frame.data[0] = 0x02;
+    send(&frame);
+  }
+
+  void VescCanInterface::setCurrent(double current) 
+  {
+    // send(VescPacketSetCurrent(current));
+  }
+
+  void VescCanInterface::setBrake(double brake) 
+  {
+    // send(VescPacketSetCurrentBrake(brake));
+  }
+
+  void VescCanInterface::setSpeed(double speed) 
+  {
+    // send(VescPacketSetVelocityERPM(speed));
+  }
+
+  void VescCanInterface::setPosition(double position) 
+  {
+    // send(VescPacketSetPos(position));
+  }
+ 
   void VescCanInterface::start(uint32_t dev_id) 
   {
+    status_.connection_state = WAITING_FOR_FW;
     m_dev_id = dev_id;
     // Set kernel-level filter for CANID
     struct can_filter rfilter[1];
