@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <mutex>
 #include <vector>
+#include <condition_variable>
 
 #include <net/if.h>
 #include <sys/types.h>
@@ -45,6 +46,7 @@ namespace vesc_can_driver
     int m_commands_send;
     uint16_t m_rxbuf_len;
     uint16_t m_crc_check;
+    std::chrono::time_point<std::chrono::steady_clock> m_last_rx_packet = std::chrono::steady_clock::now();
     int process_rx_buffer();
     int handle_packet();
     uint32_t genEId(uint32_t, uint32_t);
@@ -55,6 +57,7 @@ namespace vesc_can_driver
     std::mutex m_tx_mutex;
     pthread_t rx_thread_handle_;
     pthread_t update_thread_handle_;
+    std::condition_variable status_cv_;
     static void *rx_thread_helper(void *context) 
     {
       return ((VescCanInterface *) context)->rx_thread();
@@ -67,6 +70,7 @@ namespace vesc_can_driver
   public:
     VescStatusStruct status_;
     int m_pack;
+    uint8_t host_id;
 
   public:
     VescCanInterface();
@@ -77,7 +81,8 @@ namespace vesc_can_driver
     void *update_thread();
     void *rx_thread();
 
-    int get_status(VescStatusStruct *status);
+    void get_status(VescStatusStruct *status);
+    void wait_for_status(VescStatusStruct *status);
     void requestState();
     void requestFWVersion();
     void setDutyCycle(double);

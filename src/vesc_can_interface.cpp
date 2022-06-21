@@ -21,12 +21,19 @@ namespace vesc_can_driver
     }
     m_addr.can_family = AF_CAN;
     m_addr.can_ifindex = m_ifr.ifr_ifindex;
+
+    // struct timeval tv;
+    // tv.tv_sec = 0;
+    // tv.tv_usec = 1000*1000;
+    // setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv); // Might be useful
     
     if ((m_sock_err = bind(m_socket, (struct sockaddr *)&m_addr, sizeof(m_addr)))<0)
     {
       printf("ERROR unable to bind to interface: %s, error code:%d\n", m_ifr.ifr_name, m_sock_err);
       return;
     }
+    can_err_mask_t optval = CAN_ERR_MASK;
+    setsockopt(m_socket, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &optval, sizeof(optval));
   }
 
   VescCanInterface::~VescCanInterface() 
@@ -53,7 +60,7 @@ namespace vesc_can_driver
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fw_request).count() >
             1000) 
         {
-          printf("Requesting \n");
+          printf("Requesting FW\n");
           last_fw_request = now;
           requestFWVersion();
         }
@@ -64,7 +71,7 @@ namespace vesc_can_driver
         // requestState();
       }
     }
-    printf("Joining Update Thread");
+    printf("Joining Update Thread\n");
     return nullptr;
   }
 
@@ -72,7 +79,6 @@ namespace vesc_can_driver
   {
     Buffer buffer;
     buffer.reserve(4096);
-
     {
       std::unique_lock<std::mutex> lk(status_mutex_);
       status_ = {0};
@@ -80,10 +86,14 @@ namespace vesc_can_driver
     }
     while (rx_thread_run_) 
     {
-      // Check, if the serial port is connected. If not, connect to it.
-      if (m_socket < 0 || m_sock_err < 0) 
+      std::chrono::time_point<std::chrono::steady_clock> now = std::chrono::steady_clock::now();
+      if (m_socket < 0 || 
+          m_sock_err < 0 ||
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_rx_packet).count() > 10000)
+      // if (m_socket < 0 || m_sock_err < 0) 
       {
         {
+          printf("Socker error\n");
           std::unique_lock<std::mutex> lk(status_mutex_);
           status_ = {0};
           status_.connection_state = DISCONNECTED;
@@ -91,6 +101,7 @@ namespace vesc_can_driver
         try 
         {
           rx_thread_run_ = 0;
+          continue;
           //TODO reconnect();
         }
         catch (std::exception &e) 
@@ -105,95 +116,8 @@ namespace vesc_can_driver
         }
       }
       m_pack = handle_packet();
+      // last_rx_packet = now;
     }
-/*
-
-      int bytes_needed = VescFrame::VESC_MIN_FRAME_SIZE;
-      if (!buffer.empty()) 
-      {
-        // search buffer for valid packet(s)
-        Buffer::iterator iter(buffer.begin());
-        Buffer::iterator iter_begin(buffer.begin());
-        while (iter != buffer.end()) 
-        {
-          // check if valid start-of-frame character
-          if (VescFrame::VESC_SOF_VAL_SMALL_FRAME == *iter ||
-              VescFrame::VESC_SOF_VAL_LARGE_FRAME == *iter) 
-          {
-            // good start, now attempt to create packet
-            std::string error;
-            VescPacketConstPtr packet = VescPacketFactory::createPacket(iter, buffer.end(),
-                                                                        &bytes_needed,
-                                                                        &error);
-            if (packet) 
-            {
-              // good packet, check if we skipped any data
-              if (std::distance(iter_begin, iter) > 0) 
-              {
-                std::ostringstream ss;
-                ss << "Out-of-sync with VESC, unknown data leading valid frame. Discarding "
-                   << std::distance(iter_begin, iter) << " bytes.";
-                error_handler_(ss.str());
-              }
-              // call packet handler
-
-              handle_packet(packet);
-              // update state
-              iter = iter + packet->getFrame().size();
-              iter_begin = iter;
-              // continue to look for another frame in buffer
-              continue;
-            }
-            else if (bytes_needed > 0) 
-            {
-              // need more data, break out of while loop
-              break;  // for (iter_sof...
-            } 
-            else 
-            {
-              // else, this was not a packet, move on to next byte
-              error_handler_(error);
-            }
-          }
-
-          iter++;
-        }
-
-        // if iter is at the end of the buffer, more bytes are needed
-        if (iter == buffer.end())
-            bytes_needed = VescFrame::VESC_MIN_FRAME_SIZE;
-
-        // erase "used" buffer
-        if (std::distance(iter_begin, iter) > 0) 
-        {
-          std::ostringstream ss;
-          ss << "Out-of-sync with VESC, discarding " << std::distance(iter_begin, iter) << " bytes.";
-          error_handler_(ss.str());
-        }
-        buffer.erase(buffer.begin(), iter);
-      }
-
-      // attempt to read at least bytes_needed bytes from the serial port
-      int bytes_to_read = std::max(bytes_needed, std::min(4096, static_cast<int>(serial_.available())));
-      try 
-      {
-        int bytes_read = serial_.read(buffer, bytes_to_read);
-        if (bytes_needed > 0 && 0 == bytes_read && !buffer.empty()) 
-        {
-          error_handler_("Possibly out-of-sync with VESC, read timout in the middle of a frame.");
-        }
-      } 
-      catch (std::exception &e) 
-      {
-        error_handler_("error during serial read. reconnecting.");
-        {
-          std::unique_lock<std::mutex> lk(status_mutex_);
-          status_.connection_state = VESC_CONNECTION_STATE::DISCONNECTED;
-        }
-        serial_.close();
-      }
-    }
-  */
     close(m_socket);
     return nullptr;
   }
@@ -201,6 +125,24 @@ namespace vesc_can_driver
   int VescCanInterface::handle_packet()
   {
     m_nbytes = read(m_socket, &m_recvframe, sizeof(struct can_frame));
+    if(m_nbytes < 0)
+    {
+      perror("can raw socket read");
+      printf("Error reading\n");
+      return -1;
+    }
+    if((m_recvframe.can_id & 0xF0000000) == 0x20000000)
+    {
+      // printf("Error frame\n");
+      // printf("Id: %x\n",(int)m_recvframe.can_id);
+      // printf("Data: %x, %x, %x, %x, %x, %x, %x, %x\n",(int)m_recvframe.data[0],
+      //                            (int)m_recvframe.data[1],(int)m_recvframe.data[2],
+      //                           (int)m_recvframe.data[3],(int)m_recvframe.data[4],
+      //   (int)m_recvframe.data[5],(int)m_recvframe.data[6],(int)m_recvframe.data[7]);
+      // m_sock_err = -1;
+      return -1;
+    }
+    m_last_rx_packet = std::chrono::steady_clock::now();
     int ind = 0;
     uint8_t recv_id = m_recvframe.can_id;
     uint8_t pack_id = m_recvframe.can_id >> 8;  
@@ -301,20 +243,22 @@ namespace vesc_can_driver
   bool VescCanInterface::send(can_frame *send_frame) 
   {
     std::unique_lock<std::mutex> lk(m_tx_mutex);
-    if (m_sock_err>=0) 
+    if (m_sock_err == 0) 
     {
       int i = write(m_socket, send_frame, sizeof(struct can_frame));
-      printf("Written %d\n", i);
+      // printf("Written %d\n", i);
+      return false;
     }
-    return true;
+    else
+      return true;
   }
 
   void VescCanInterface::requestFWVersion() 
   {
     can_frame frame;
-    frame.can_id = genEId(0x2D, CAN_PACKET_PROCESS_SHORT_BUFFER); 
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_PROCESS_SHORT_BUFFER); 
     frame.can_dlc = 0x1;  
-    frame.data[0] = 0x02;
+    frame.data[0] = host_id;
     send(&frame);
   }
 
@@ -323,53 +267,68 @@ namespace vesc_can_driver
     id |= packet_id << 8;  // Next lowest byte is the packet id.
     return(id |= 0x80000000);              // Send in Extended Frame Format.
   }
-/*
-  void VescCanInterface::requestState() {
-      send(VescPacketRequestValues());
-  }
-*/
+
   void VescCanInterface::setDutyCycle(double duty_cycle) 
   {
     can_frame frame;
-    uint8_t can_buff[16];
     int32_t ind = 0;
     frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_DUTY); 
-    printf("Filling buf\n");
-    bldc_buffer_append_float32(can_buff, duty_cycle,1e5, &ind); 
-    printf("buff filled");
-    frame.can_dlc = 0x1;  
-    frame.data[0] = 0x02;
+    bldc_buffer_append_float32(frame.data, duty_cycle, 1e5, &ind); 
+    frame.can_dlc = 0x8;  
     send(&frame);
   }
 
   void VescCanInterface::setCurrent(double current) 
   {
-    // send(VescPacketSetCurrent(current));
+    can_frame frame;
+    int32_t ind = 0;
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_CURRENT); 
+    bldc_buffer_append_float32(frame.data, current,1e3, &ind); 
+    frame.can_dlc = 0x8;  
+    frame.data[0] = 0x02;
+    send(&frame);
   }
 
   void VescCanInterface::setBrake(double brake) 
   {
-    // send(VescPacketSetCurrentBrake(brake));
+    can_frame frame;
+    int32_t ind = 0;
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_CURRENT_BRAKE); 
+    bldc_buffer_append_float32(frame.data, brake,1e3, &ind); 
+    frame.can_dlc = 0x8;  
+    send(&frame);
   }
 
   void VescCanInterface::setSpeed(double speed) 
   {
-    // send(VescPacketSetVelocityERPM(speed));
+    can_frame frame;
+    int32_t ind = 0;
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_RPM); 
+    bldc_buffer_append_float32(frame.data, speed,1e0, &ind); 
+    frame.can_dlc = 0x8;  
+    send(&frame);
   }
 
   void VescCanInterface::setPosition(double position) 
   {
-    // send(VescPacketSetPos(position));
+    can_frame frame;
+    int32_t ind = 0;
+    frame.can_id = genEId(m_dev_id, CAN_PACKET_SET_POS); 
+    bldc_buffer_append_float32(frame.data, position,1e6, &ind); 
+    frame.can_dlc = 0x8;  
+    send(&frame);
   }
  
   void VescCanInterface::start(uint32_t dev_id) 
   {
     status_.connection_state = WAITING_FOR_FW;
     m_dev_id = dev_id;
-    // Set kernel-level filter for CANID
-    struct can_filter rfilter[1];
+    // Set filter for CANID
+    struct can_filter rfilter[2];
     rfilter[0].can_id = m_dev_id;
     rfilter[0].can_mask = 0xFF;
+    rfilter[1].can_id = host_id;
+    rfilter[1].can_mask = 0xFF;
     setsockopt(m_socket, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(rfilter));
     // start threads
     rx_thread_run_ = true;
@@ -378,31 +337,37 @@ namespace vesc_can_driver
     pthread_create(&update_thread_handle_, NULL, &VescCanInterface::update_thread_helper, this);
   }
 
-  void VescCanInterface::stop() {
-      // stops the motor
-      // setDutyCycle(0.0);
+  void VescCanInterface::stop() 
+  {
+    // stops the motor
+    setDutyCycle(0.0);
 
-      // tell the io thread to stop
-      rx_thread_run_ = false;
-      update_thread_run_ = false;
+    // tell the io thread to stop
+    rx_thread_run_ = false;
+    update_thread_run_ = false;
 
-      // wait for io thread to actually exit
-      pthread_join(rx_thread_handle_, nullptr);
-      pthread_join(update_thread_handle_, nullptr);
-  }
-/*
-  void VescCanInterface::get_status(VescStatusStruct *status) {
-      std::unique_lock<std::mutex> lk(status_mutex_);
-      *status = status_;
+    // wait for io thread to actually exit
+    pthread_join(rx_thread_handle_, nullptr);
+    pthread_join(update_thread_handle_, nullptr);
+    if (close(m_socket) < 0) 
+    {
+      printf("Close");
+    }
   }
 
-  void VescCanInterface::wait_for_status(VescStatusStruct *status) {
-      std::unique_lock<std::mutex> lk(status_mutex_);
-      // wait for new data
-      status_cv_.wait(lk);
-      *status = status_;
+  void VescCanInterface::get_status(VescStatusStruct *status) 
+  {
+    std::unique_lock<std::mutex> lk(status_mutex_);
+    *status = status_;
   }
-*/
+
+  void VescCanInterface::wait_for_status(VescStatusStruct *status) 
+  {
+    std::unique_lock<std::mutex> lk(status_mutex_);
+    // wait for new data
+    status_cv_.wait(lk);
+    *status = status_;
+  }
 }
 
 void bldc_buffer_append_int16(uint8_t* buffer, int16_t number, int32_t *index)

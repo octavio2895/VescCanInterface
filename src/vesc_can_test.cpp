@@ -1,13 +1,18 @@
+#include "datatypes.h"
 #include "vesc_can_interface.h" 
+#include <cstddef>
 #include <iostream>
 
 int main(int argc, char *argv[])
 {
   int id = atoi(argv[1]);
+  srand (time(NULL));
   std::cout << "Started demo, creating instace" << std::endl;
   vesc_can_driver::VescCanInterface vesc_dev;
+  vesc_dev.host_id = rand() % 255; //TODO check for collision
   std::cout << "Init thread" << std::endl;
   vesc_dev.start(id);
+  printf("Host id:%d\n", vesc_dev.host_id);
   std::cout << "Instance created, starting loop" << std::endl;
   while(vesc_dev.m_pack != CAN_PACKET_PROCESS_RX_BUFFER)
   {
@@ -28,8 +33,13 @@ int main(int argc, char *argv[])
   printf("Setting DC to 50\n");
   for (int i = 0 ; i < 100000; i++)
   {
-    vesc_dev.setDutyCycle(5);
-    usleep(20);
+    if(vesc_dev.status_.connection_state != CONNECTED)
+    {
+        printf("VESC disconnected midway\n");
+        break;
+    }
+    vesc_dev.setSpeed(300);
+    usleep(100000); //TODO less than 1% bus usage at 500khz
   }
   std::cin.get();
 }
