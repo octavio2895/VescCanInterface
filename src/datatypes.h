@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+namespace vesc_can_driver
+{
 enum VESC_CONNECTION_STATE
 {
   DISCONNECTED,
@@ -269,4 +271,5 @@ typedef enum {
 
   COMM_LISP_REPL_CMD,
 } COMM_PACKET_ID;
+}
 #endif

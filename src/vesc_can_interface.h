@@ -77,7 +77,7 @@ namespace vesc_can_driver
     ~VescCanInterface();
     void stop(); 
     bool send(can_frame *frame); 
-    void start(uint32_t id); 
+    void start(const std::string &int_name, uint32_t id); 
     void *update_thread();
     void *rx_thread();
 
