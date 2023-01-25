@@ -112,8 +112,8 @@ namespace vesc_can_driver
                                  (int)m_recvframe.data[1],(int)m_recvframe.data[2],
                                 (int)m_recvframe.data[3],(int)m_recvframe.data[4],
         (int)m_recvframe.data[5],(int)m_recvframe.data[6],(int)m_recvframe.data[7]);
-      m_sock_err = -1;
-      return -1;
+      // m_sock_err = -1;
+      // return -1;
     }
     m_last_rx_packet = std::chrono::steady_clock::now();
     int ind = 0;
